@@ -45,6 +45,8 @@ object stm {
     }
 
     def value = _value
+
+    override def toString = s"(TVAR: id: $id , value $value , timestamp $timestamp)"
   }
 
   private[stm] final class Entry[A](tvar: TVar[A], timestamp: Long, @volatile private var current: A) {
@@ -52,6 +54,8 @@ object stm {
     def commit(): Unit = tvar.update(current)
     def value = current
     def write(a: A) = current = a
+
+    override def toString = s"tvar $tvar , value: $value, timestamp $timestamp"
   }
 
 
@@ -67,11 +71,7 @@ object stm {
     def commit(): Unit =
       entries.foreach(_._2.commit)
 
-    // def rollback(): Unit = {
-    //   entries.foreach {case (k, _) =>  entries -= k }
-    //   println("rollback")
-    // }
-      
+    override def toString = entries.map { case (_, v) => v.toString}.mkString("\n")
   }
 
   def interpreter(trec: TRec): STM_ ~> IO =
@@ -98,7 +98,7 @@ object stm {
 
 
 
-  def atomically[A]: STM[A] => IO[A] = p => {
+  def atomically[A](s: String): STM[A] => IO[A] = p => {
     def atomic: IO[A] = IO(new TRec(mutable.Map.empty)).flatMap { trec =>
 
       // IDEA: let the interpreter return a `trec => IO`, so that I can use the
@@ -108,12 +108,14 @@ object stm {
         STM.globalLock.withPermit {
           IO {
             val valid = trec.validate
+            println(s"$s: BEFORE trec: $trec, valid? $valid")
             if(valid) trec.commit
+            println(s"$s: AFTER trec: $trec")
             valid
           }
         }.ifM(
-          result.pure[IO],
-          atomic
+          IO(println(s"$s: success $result \n\n")) *> result.pure[IO],
+          IO(println(s"$s: abort \n\n")) *> atomic
         )
       }
     }
@@ -132,19 +134,54 @@ object stm {
       } yield ()
 
     def runner = for {
-      account <- atomically(newTVar(200))
-      p1 <- atomically(prog(account, 100)).start
-      p2 <- atomically(prog(account, 100)).start
+      account <- atomically("var")(newTVar(200))
+      p1 <- atomically("p1")(prog(account, 100)).start
+      p2 <- atomically("p2")(prog(account, 100)).start
       _ <- p1.join
       _ <- p2.join
-      v <- atomically(readTVar(account))
-    } yield v
+      v <- atomically("read")(readTVar(account))
+      _ <- IO(println("------------------------------"))
+    } yield ()//v
 
 
     def tests =
       List.fill(100000)(runner).sequence
 
     tests.unsafeRunSync.forall(_ == 0)
+    //    runner.iterateUntil(_ != 0).unsafeRunSync
+    //runner.unsafeRunSync
   }
 
 }
+
+// var: BEFORE trec: , valid? true
+// var: AFTER trec: 
+// var: success (TVAR: id: Token(798a4b0) , value 200 , timestamp 0) 
+
+
+// p1: BEFORE trec: tvar (TVAR: id: Token(798a4b0) , value 200 , timestamp 0) , value: 100, timestamp 0, valid? true
+// p1: AFTER trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 1) , value: 100, timestamp 0
+// p1: success () 
+
+// since value is 100, it means it had read 200 as the initial value, but somehow with a timestamp of 1
+// there definitely is a race between reading from one fiber and committing in another
+// can it be solved without locking?
+// race in readTVar:
+//  case None =>
+//   val v = tvar.value
+//   trec.insert(tvar, v)
+//    |
+//    ---   another fiber commits here and changes the timestamp: new timestamp for old value: BUG
+//    | entries += tvar.id -> new Entry(tvar.asInstanceOf[TVar[Any]], tvar.timestamp, v)
+//    |
+//   v
+
+
+// p2: BEFORE trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 1) , value: 100, timestamp 1, valid? true
+// p2: AFTER trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 2) , value: 100, timestamp 1
+// p2: success () 
+
+
+// read: BEFORE trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 2) , value: 100, timestamp 2, valid? true
+// read: AFTER trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 3) , value: 100, timestamp 2
+// read: success 100 
