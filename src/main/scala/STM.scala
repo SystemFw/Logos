@@ -40,8 +40,9 @@ object stm {
     def timestamp = _timestamp
 
     def update(v: A): Unit = {
-      _value = v
+      // ordering important since +=1 is not atomic?
       _timestamp += 1
+      _value = v
     }
 
     def value = _value
@@ -105,7 +106,7 @@ object stm {
   def atomically[A](s: String): STM[A] => IO[A] = p => {
     def atomic: IO[A] = IO(new TRec(mutable.Map.empty)).flatMap { trec =>
 
-      // IDEA: let the interpreter return a `trec => IO`, so that I can use the
+      // TODO IDEA: let the interpreter return a `trec => IO`, so that I can use the
       // the partial interpreter trick and foldMap the Free only once, and not at
       // every re-run
       p.foldMap(interpreter(trec)).flatMap { result =>
@@ -128,6 +129,11 @@ object stm {
 
     atomic
   }
+
+
+  // TODO IDEA
+  // use something similar to quickcheck stateful testing to simulate all possible interleavings and state invariants, for example the read vs commit race
+
 
   def t1 = {
     import scala.concurrent.ExecutionContext.Implicits.global
@@ -156,9 +162,7 @@ object stm {
     tests.unsafeRunSync.forall(_ == 0)
     //    runner.iterateUntil(_ != 0).unsafeRunSync
     //runner.unsafeRunSync
-  }
-
-}
+    }
 
 // var: BEFORE trec: , valid? true
 // var: AFTER trec:
@@ -191,3 +195,40 @@ object stm {
 // read: BEFORE trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 2) , value: 100, timestamp 2, valid? true
 // read: AFTER trec: tvar (TVAR: id: Token(798a4b0) , value 100 , timestamp 3) , value: 100, timestamp 2
 // read: success 100
+
+
+  def t2 = {
+     import scala.concurrent.ExecutionContext.Implicits.global
+
+    def transfer(from: TVar[Int], to: TVar[Int], amount: Int): STM[Unit] =
+      for {
+        fromB <- readTVar(from)
+        toB <- readTVar(to)
+        _ <- writeTVar(from, fromB - amount)
+        _ <- writeTVar(to, toB + amount)
+      } yield ()
+
+    def runner = for {
+      from <- atomically("from")(newTVar(200))
+      to <- atomically("to")(newTVar(0))
+      p1 <- atomically("p1")(transfer(from, to, 100)).start
+      p2 <- atomically("p2")(transfer(from, to, 100)).start
+      _ <- p1.join
+      _ <- p2.join
+      v <- atomically("read")((readTVar(from), readTVar(to)).tupled)
+    //  _ <- IO(println("------------------------------"))
+    } yield v
+
+
+    def tests =
+      List.fill(100000)(runner).sequence
+
+    tests.unsafeRunSync.forall(_ == (0, 200))
+    //    runner.iterateUntil(_ != 0).unsafeRunSync
+    //runner.unsafeRunSync
+  }
+
+}
+
+
+
